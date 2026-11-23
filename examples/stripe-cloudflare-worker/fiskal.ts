@@ -161,9 +161,10 @@ export function fiskalKlijent(o: FiskalOpcije) {
     /**
      * Pošalji PDF e-mailom (default na `kupac.email`). Dok fiskalni račun čeka
      * JIR, Fiskal odbija slanje s 409 (`kod: 'NEMA_JIR'`) — pokušaj kasnije.
+     * `bezJir: true` šalje račun samo sa ZKI-jem; koristi samo na izričit zahtjev.
      */
-    async posalji(id: number, na?: string): Promise<unknown> {
-      return (await zahtjev('POST', `/racun/${id}/posalji`, na ? { na } : {})).json;
+    async posalji(id: number, opcije: { na?: string; bezJir?: boolean } = {}): Promise<unknown> {
+      return (await zahtjev('POST', `/racun/${id}/posalji`, opcije)).json;
     },
 
     /**

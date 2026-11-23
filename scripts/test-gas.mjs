@@ -18,8 +18,44 @@ import { buildEvent } from './build-gas.mjs';
 const slug = process.argv[2] || 'primjer-konferencija-2027';
 const code = fs.readFileSync(buildEvent(slug), 'utf8');
 
-function kontekst({ sheetId, odgovori = [], kljuc = 'dfk_' + 'a'.repeat(64) } = {}) {
+/** Minimalni Sheet: ćelije [red][stupac], 1-indeksirano; bilježi boje pozadine. */
+function lazniSheet(redci, ime = 'Responses') {
+  const pod = redci.map((r) => [...r]);
+  const boje = {};
+  const sheet = {
+    pod, boje,
+    getName: () => ime,
+    getLastRow: () => pod.length,
+    getLastColumn: () => Math.max(...pod.map((r) => r.length)),
+    getActiveRange: () => ({ getRow: () => sheet.aktivniRed }),
+    aktivniRed: 2,
+    getRange(r, c, nr = 1, nc = 1) {
+      const raspon = {
+        getValue: () => pod[r - 1]?.[c - 1] ?? '',
+        getValues: () => Array.from({ length: nr }, (_, i) => Array.from({ length: nc }, (_, j) => pod[r - 1 + i]?.[c - 1 + j] ?? '')),
+        setValue(v) { (pod[r - 1] ??= [])[c - 1] = v; return raspon; },
+        setRichTextValue(v) { (pod[r - 1] ??= [])[c - 1] = v.tekst; return raspon; },
+        setBackground(b) { boje[r + ',' + c] = b; return raspon; },
+      };
+      return raspon;
+    },
+  };
+  return sheet;
+}
+
+/** Vrijednost ćelije po nazivu stupca. */
+const celija = (sheet, red, naziv) => sheet.pod[red - 1][sheet.pod[0].indexOf(naziv)];
+const boja = (sheet, red, naziv) => sheet.boje[red + ',' + (sheet.pod[0].indexOf(naziv) + 1)];
+
+function kontekst({ sheetId, odgovori = [], kljuc = 'dfk_' + 'a'.repeat(64), sheet = null, gumbi = [] } = {}) {
   const pozivi = [];
+  const dijalozi = [];
+  const ui = {
+    Button: { YES: 'YES', NO: 'NO', OK: 'OK' },
+    ButtonSet: { OK: 'OK', YES_NO: 'YES_NO' },
+    alert(naslov, poruka, set) { dijalozi.push({ naslov, poruka: poruka ?? '' }); return set === 'YES_NO' ? gumbi.shift() ?? 'NO' : 'OK'; },
+  };
+  const ss = { getId: () => sheetId, getSheetByName: () => sheet, getActiveSheet: () => sheet, toast: () => {} };
   const ctx = {
     Logger: { log: () => {} },
     Utilities: {
@@ -30,7 +66,17 @@ function kontekst({ sheetId, odgovori = [], kljuc = 'dfk_' + 'a'.repeat(64) } = 
       sleep: () => {},
     },
     PropertiesService: { getScriptProperties: () => ({ getProperty: (k) => (k === 'FISKAL_API_KEY' ? kljuc : null) }) },
-    SpreadsheetApp: { getActive: () => ({ getId: () => sheetId }) },
+    SpreadsheetApp: {
+      getActive: () => ss,
+      getActiveSpreadsheet: () => ss,
+      getActiveSheet: () => sheet,
+      getUi: () => ui,
+      newRichTextValue() {
+        const v = {};
+        const b = { setText: (t) => { v.tekst = t; return b; }, setLinkUrl: (u) => { v.url = u; return b; }, build: () => v };
+        return b;
+      },
+    },
     UrlFetchApp: {
       fetch(url, opcije) {
         pozivi.push({ url, opcije });
@@ -47,7 +93,7 @@ function kontekst({ sheetId, odgovori = [], kljuc = 'dfk_' + 'a'.repeat(64) } = 
   };
   vm.createContext(ctx);
   vm.runInContext(code, ctx);
-  return { ctx, pozivi };
+  return { ctx, pozivi, dijalozi };
 }
 
 let prolaz = 0;
@@ -237,6 +283,134 @@ test('ceka_jir → status „čeka JIR”', () => {
   assert.equal(c0.fiskalStatusRacuna_({ fiskalizacija: { status: 'ceka_jir' } }), 'IZDAN – čeka JIR');
   assert.equal(c0.fiskalOpisRacuna_({ brojRacuna: '1/2/1', tip: 'fiskalni_b2c' }), '1/2/1 · čeka JIR');
   assert.equal(c0.fiskalOpisRacuna_(racun), '8/2/1 · JIR abcdef12…');
+});
+
+// ── E-mail ─────────────────────────────────────────────────────────────────
+console.log('e-mail kupcu (AUTO_EMAIL)');
+const FS = c0.FISKAL_STUPCI_;
+const racunCeka = { id: 9, brojRacuna: '9/2/1', tip: 'fiskalni_b2c', jir: null, fiskalizacija: { status: 'ceka_jir' }, poslanoEmail: null };
+const posalji200 = { code: 200, json: { ok: true, poslanoNa: 'ana.test@example.com' } };
+const nemaJir409 = { code: 409, json: { greska: 'Račun još nema JIR', kod: 'NEMA_JIR' } };
+const noviSheet = () => lazniSheet([headers, red()]);
+const posaljiPozivi = (pozivi) => pozivi.filter((p) => p.url.endsWith('/posalji'));
+
+test('AUTO_EMAIL je uključen u primjeru', () => assert.equal(c0.CONFIG.FISKAL.AUTO_EMAIL, true));
+
+test('izdavanje s JIR-om → /posalji s {} odmah, stupac „poslano na …”', () => {
+  const sheet = noviSheet();
+  const { ctx, pozivi } = kontekst({ sheetId: TEST_SHEET, sheet, odgovori: [{ code: 201, json: { ...racun, poslanoEmail: null } }, posalji200] });
+  const ishod = ctx.izdajFiskalniZaRedak_(2, true);
+  assert.equal(ishod.email.ok, true);
+  const p = posaljiPozivi(pozivi);
+  assert.equal(p.length, 1);
+  assert.ok(p[0].url.endsWith('/racun/7/posalji'));
+  assert.deepEqual(JSON.parse(p[0].opcije.payload), {});
+  assert.match(celija(sheet, 2, FS.EMAIL), /^poslano na ana\.test@example\.com \(/);
+  assert.equal(boja(sheet, 2, FS.EMAIL), null);
+  assert.equal(celija(sheet, 2, FS.ID), 7);
+});
+
+test('ponovljen račun s već poslanim mailom → nema /posalji', () => {
+  const sheet = noviSheet();
+  const { ctx, pozivi } = kontekst({ sheetId: TEST_SHEET, sheet, odgovori: [{ code: 200, json: { ...racun, poslanoEmail: { kada: '2026-11-23T10:00:00Z', na: 'x@y.hr' } } }] });
+  ctx.izdajFiskalniZaRedak_(2, true);
+  assert.equal(posaljiPozivi(pozivi).length, 0);
+});
+
+test('izdavanje bez JIR-a → bez /posalji, stupac „čeka JIR” (žuto, nije greška)', () => {
+  const sheet = noviSheet();
+  const { ctx, pozivi } = kontekst({ sheetId: TEST_SHEET, sheet, odgovori: [{ code: 201, json: racunCeka }] });
+  const ishod = ctx.izdajFiskalniZaRedak_(2, true);
+  assert.equal(posaljiPozivi(pozivi).length, 0);
+  assert.equal(ishod.email.cekaJir, true);
+  assert.equal(celija(sheet, 2, FS.EMAIL), c0.FISKAL_EMAIL_CEKA_JIR_);
+  assert.equal(boja(sheet, 2, FS.EMAIL), '#fff2cc');
+  assert.equal(celija(sheet, 2, FS.STATUS), 'IZDAN – čeka JIR');
+});
+
+test('/posalji vrati 409 NEMA_JIR → „čeka JIR”, bez crvenog', () => {
+  const sheet = noviSheet();
+  const { ctx } = kontekst({ sheetId: TEST_SHEET, sheet, odgovori: [nemaJir409] });
+  const rez = ctx.fiskalPosaljiEmailZaRedak_(sheet, 2, 9);
+  assert.equal(rez.ok, false);
+  assert.equal(rez.cekaJir, true);
+  assert.equal(celija(sheet, 2, FS.EMAIL), c0.FISKAL_EMAIL_CEKA_JIR_);
+  assert.notEqual(boja(sheet, 2, FS.EMAIL), '#f4cccc');
+});
+
+test('drugi 409 (ne NEMA_JIR) / 502 → „NIJE poslano” crveno', () => {
+  const sheet = noviSheet();
+  const { ctx } = kontekst({ sheetId: TEST_SHEET, sheet, odgovori: [{ code: 502, json: { greska: 'Resend odbio' } }] });
+  const rez = ctx.fiskalPosaljiEmailZaRedak_(sheet, 2, 9);
+  assert.equal(rez.cekaJir, undefined);
+  assert.match(celija(sheet, 2, FS.EMAIL), /^NIJE poslano — Slanje nije uspjelo: Resend odbio/);
+  assert.equal(boja(sheet, 2, FS.EMAIL), '#f4cccc');
+});
+
+// Sheet s već izdanim računom koji čeka JIR (redak 2) i jednim gotovim (redak 3)
+const sheetCeka = (email = c0.FISKAL_EMAIL_CEKA_JIR_) => {
+  const h = [...headers, FS.STATUS, FS.ID, FS.EMAIL];
+  return lazniSheet([h, [...red(), 'IZDAN – čeka JIR', 9, email], [...red(), 'IZDAN', 7, 'poslano na x (1.1.2027. 10:00)']]);
+};
+
+test('osvježi: dobio JIR, poslanoEmail null → /posalji točno jednom', () => {
+  const sheet = sheetCeka();
+  const { ctx, pozivi, dijalozi } = kontekst({ sheetId: TEST_SHEET, sheet, odgovori: [
+    { code: 200, json: { ...racunCeka, jir: 'feedbeef-1', fiskalizacija: { status: 'fiskaliziran' } } }, posalji200] });
+  ctx.fiskalOsvjeziStatuse();
+  assert.equal(pozivi.length, 2); // samo redak 2: GET + POST
+  assert.ok(pozivi[0].url.endsWith('/racun/9'));
+  assert.equal(posaljiPozivi(pozivi).length, 1);
+  assert.equal(celija(sheet, 2, FS.STATUS), 'IZDAN');
+  assert.match(celija(sheet, 2, FS.EMAIL), /^poslano na /);
+  assert.match(dijalozi[0].poruka, /Poslano e-mailom: 1/);
+});
+
+test('osvježi drugi put → redak više nije „čeka”, nema novih poziva', () => {
+  const sheet = sheetCeka();
+  const k1 = kontekst({ sheetId: TEST_SHEET, sheet, odgovori: [
+    { code: 200, json: { ...racunCeka, jir: 'feedbeef-1', fiskalizacija: { status: 'fiskaliziran' } } }, posalji200] });
+  k1.ctx.fiskalOsvjeziStatuse();
+  const k2 = kontekst({ sheetId: TEST_SHEET, sheet, odgovori: [] });
+  k2.ctx.fiskalOsvjeziStatuse();
+  assert.equal(k2.pozivi.length, 0);
+});
+
+test('osvježi: JIR stigao, ali poslanoEmail već postoji → bez /posalji, stupac usklađen', () => {
+  const sheet = sheetCeka();
+  const { ctx, pozivi } = kontekst({ sheetId: TEST_SHEET, sheet, odgovori: [
+    { code: 200, json: { ...racunCeka, jir: 'feedbeef-1', fiskalizacija: { status: 'fiskaliziran' }, poslanoEmail: { kada: '2026-11-23T17:00:00Z', na: 'ana@x.hr' } } }] });
+  ctx.fiskalOsvjeziStatuse();
+  assert.equal(posaljiPozivi(pozivi).length, 0);
+  assert.match(celija(sheet, 2, FS.EMAIL), /^poslano na ana@x\.hr \(/);
+});
+
+test('osvježi: i dalje bez JIR-a → bez /posalji, stupac ostaje „čeka JIR”', () => {
+  const sheet = sheetCeka();
+  const { ctx, pozivi } = kontekst({ sheetId: TEST_SHEET, sheet, odgovori: [{ code: 200, json: racunCeka }] });
+  ctx.fiskalOsvjeziStatuse();
+  assert.equal(posaljiPozivi(pozivi).length, 0);
+  assert.equal(celija(sheet, 2, FS.EMAIL), c0.FISKAL_EMAIL_CEKA_JIR_);
+});
+
+test('ručno: 409 NEMA_JIR → dijalog; NE → ništa više', () => {
+  const sheet = sheetCeka('');
+  const { ctx, pozivi, dijalozi } = kontekst({ sheetId: TEST_SHEET, sheet, odgovori: [nemaJir409], gumbi: ['NO'] });
+  ctx.fiskalPosaljiEmail();
+  assert.equal(pozivi.length, 1);
+  assert.match(dijalozi[0].poruka, /nema JIR\. Poslati samo sa ZKI-jem\?/);
+  assert.equal(celija(sheet, 2, FS.EMAIL), c0.FISKAL_EMAIL_CEKA_JIR_);
+});
+
+test('ručno: 409 NEMA_JIR → DA → /posalji { bezJir: true }', () => {
+  const sheet = sheetCeka('');
+  const { ctx, pozivi, dijalozi } = kontekst({ sheetId: TEST_SHEET, sheet, odgovori: [nemaJir409, posalji200], gumbi: ['YES'] });
+  ctx.fiskalPosaljiEmail();
+  assert.equal(pozivi.length, 2);
+  assert.deepEqual(JSON.parse(pozivi[0].opcije.payload), {});
+  assert.deepEqual(JSON.parse(pozivi[1].opcije.payload), { bezJir: true });
+  assert.match(celija(sheet, 2, FS.EMAIL), /^poslano na .* \(bez JIR-a, samo ZKI\)/);
+  assert.equal(dijalozi.at(-1).naslov, '✅ E-mail');
 });
 
 // Payload za vanjsku provjeru sheme (scripts/test-shema.sh)

@@ -33,6 +33,10 @@ var FISKAL_STATUS_ = {
   GRESKA: 'GREŠKA'
 };
 
+// Stupac „Fiskal E-mail” dok fiskalni račun nema JIR (Fiskal tada vraća 409 NEMA_JIR).
+// Nije greška: mail ide iz 🔄 Osvježi status kad CIS vrati JIR.
+var FISKAL_EMAIL_CEKA_JIR_ = 'čeka JIR — mail ide nakon fiskalizacije';
+
 // Vokabular u Sheetu (isti kao kod FIRA eventa) → Fiskal tip
 var FISKAL_TIP_ = {
   'FISKALNI_RAČUN': 'FISKALNI_B2C',
@@ -318,6 +322,16 @@ function fiskalStatusRacuna_(racun) {
   return FISKAL_STATUS_.IZDAN;
 }
 
+/** Fiskalni račun kojem CIS još nije vratio JIR (mail bez JIR-a ne šaljemo automatski). */
+function fiskalCekaJir_(racun) {
+  return fiskalStatusRacuna_(racun) === FISKAL_STATUS_.CEKA_JIR || (racun.tip === 'fiskalni_b2c' && !racun.jir);
+}
+
+/** Treba li automatski poslati mail za ovaj račun: uključeno, nije nacrt, ima JIR, još nije poslan. */
+function fiskalTrebaAutoEmail_(racun) {
+  return !!CONFIG.FISKAL.AUTO_EMAIL && racun.status !== 'nacrt' && !racun.poslanoEmail && !fiskalCekaJir_(racun);
+}
+
 /** Tekst za stupac Fiskal Račun: "1/2/1 · JIR 1a2b3c4d…" */
 function fiskalOpisRacuna_(racun) {
   var t = racun.brojRacuna || ('id ' + racun.id);
@@ -403,8 +417,12 @@ function izdajFiskalniZaRedak_(row, suppressDialogs, invoiceTypeOverride) {
     fiskalZapisiRacun_(sheet, row, ishod.racun);
     uncheckActionCheckbox(sheet, row, headers);
 
-    if (CONFIG.FISKAL.AUTO_EMAIL && ishod.racun.status !== 'nacrt' && !ishod.racun.poslanoEmail) {
+    if (fiskalTrebaAutoEmail_(ishod.racun)) {
       ishod.email = fiskalPosaljiEmailZaRedak_(sheet, row, ishod.racun.id);
+    } else if (CONFIG.FISKAL.AUTO_EMAIL && ishod.racun.status !== 'nacrt' && !ishod.racun.poslanoEmail) {
+      // Čeka JIR: ne zovemo /posalji (PROD bez pravila NEMA_JIR poslao bi mail bez JIR-a)
+      ishod.email = { ok: false, cekaJir: true, poruka: FISKAL_EMAIL_CEKA_JIR_ };
+      fiskalZapisiEmail_(sheet, row, ishod.email);
     }
 
     var naslov = '✅ ' + fiskalOpisRacuna_(ishod.racun) + (ishod.ponovljen ? ' (već izdan — isti račun)' : '');
@@ -514,18 +532,34 @@ function fiskalOdabraniRedak_() {
   return { sheet: sheet, row: row, id: id };
 }
 
-/** POST /racun/:id/posalji; neuspjeh se zapisuje, ne baca. */
-function fiskalPosaljiEmailZaRedak_(sheet, row, id) {
-  var odg = fiskalZahtjev_('post', '/racun/' + id + '/posalji', {});
+function fiskalVrijemeTekst_(d) {
+  return Utilities.formatDate(d, 'Europe/Zagreb', 'd.M.yyyy. HH:mm');
+}
+
+/** Zapis u stupac „Fiskal E-mail”: poslano (bez boje), čeka JIR (žuto), greška (crveno). */
+function fiskalZapisiEmail_(sheet, row, rez, kada) {
   var c = fiskalStupac_(sheet, FISKAL_STUPCI_.EMAIL);
+  var tekst = rez.cekaJir ? rez.poruka : rez.poruka + ' (' + fiskalVrijemeTekst_(kada || new Date()) + ')';
+  sheet.getRange(row, c).setValue(tekst)
+    .setBackground(rez.ok ? null : rez.cekaJir ? '#fff2cc' : '#f4cccc');
+}
+
+/**
+ * POST /racun/:id/posalji; neuspjeh se zapisuje, ne baca.
+ * 409 kod NEMA_JIR (fiskalni račun bez JIR-a) → { cekaJir: true }, nije greška.
+ * bezJir = true samo na izričitu potvrdu korisnika (ručna akcija).
+ */
+function fiskalPosaljiEmailZaRedak_(sheet, row, id, bezJir) {
+  var odg = fiskalZahtjev_('post', '/racun/' + id + '/posalji', bezJir ? { bezJir: true } : {});
   var rez;
   if (odg.code === 200 && odg.json && odg.json.ok) {
-    rez = { ok: true, poruka: 'poslano na ' + odg.json.poslanoNa };
+    rez = { ok: true, poruka: 'poslano na ' + odg.json.poslanoNa + (bezJir ? ' (bez JIR-a, samo ZKI)' : '') };
+  } else if (odg.code === 409 && odg.json && odg.json.kod === 'NEMA_JIR') {
+    rez = { ok: false, cekaJir: true, poruka: FISKAL_EMAIL_CEKA_JIR_ };
   } else {
     rez = { ok: false, poruka: 'NIJE poslano — ' + fiskalPorukaGreske_(odg).split('\n')[0] };
   }
-  sheet.getRange(row, c).setValue(rez.poruka + ' (' + Utilities.formatDate(new Date(), 'Europe/Zagreb', 'd.M.yyyy. HH:mm') + ')')
-    .setBackground(rez.ok ? null : '#f4cccc');
+  fiskalZapisiEmail_(sheet, row, rez);
   return rez;
 }
 
@@ -537,31 +571,59 @@ function fiskalPosaljiEmail() {
     if (vec && String(vec).indexOf('poslano na') === 0 &&
         ui.alert('Već poslano', vec + '\n\nPoslati ponovno?', ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
     var rez = fiskalPosaljiEmailZaRedak_(r.sheet, r.row, r.id);
+    if (rez.cekaJir) {
+      var bezJir = ui.alert('Račun još nema JIR',
+        'Račun još nema JIR. Poslati samo sa ZKI-jem?\n\n' +
+        (CONFIG.FISKAL.AUTO_EMAIL
+          ? 'NE = mail ide sam kad račun dobije JIR (izbornik → 🔄 Osvježi status).'
+          : 'NE = pošalji ponovno kad račun dobije JIR (izbornik → 🔄 Osvježi status).'),
+        ui.ButtonSet.YES_NO);
+      if (bezJir !== ui.Button.YES) return;
+      rez = fiskalPosaljiEmailZaRedak_(r.sheet, r.row, r.id, true);
+    }
     ui.alert(rez.ok ? '✅ E-mail' : '❌ E-mail', rez.poruka, ui.ButtonSet.OK);
   } catch (e) {
     ui.alert('❌', e.message, ui.ButtonSet.OK);
   }
 }
 
-/** Osvježi sve retke „čeka JIR” iz GET /racun/:id. */
+/**
+ * Osvježi retke „čeka JIR” (status ili e-mail) iz GET /racun/:id. Kad račun
+ * dobije JIR, a AUTO_EMAIL je uključen i mail još nije poslan (poslanoEmail
+ * null), pošalji ga — točno jednom, jer Fiskal pamti poslanoEmail.
+ */
 function fiskalOsvjeziStatuse() {
   var ui = SpreadsheetApp.getUi();
   var sheet = getRadniSheet_();
   var headers = getHeaders(sheet);
   var cS = findColumnIndex(headers, FISKAL_STUPCI_.STATUS), cId = findColumnIndex(headers, FISKAL_STUPCI_.ID);
+  var cE = findColumnIndex(headers, FISKAL_STUPCI_.EMAIL);
   if (cS === -1 || cId === -1 || sheet.getLastRow() <= 1) { ui.alert('Nema izdanih računa.'); return; }
   var n = sheet.getLastRow() - 1;
   var st = sheet.getRange(2, cS, n, 1).getValues(), ids = sheet.getRange(2, cId, n, 1).getValues();
-  var provjereno = 0, dovrseno = 0, greske = [];
+  var em = cE === -1 ? null : sheet.getRange(2, cE, n, 1).getValues();
+  var provjereno = 0, dovrseno = 0, poslano = 0, greske = [];
   for (var i = 0; i < n; i++) {
-    if (st[i][0] !== FISKAL_STATUS_.CEKA_JIR || !ids[i][0]) continue;
+    var cekaMail = !!em && em[i][0] === FISKAL_EMAIL_CEKA_JIR_;
+    if ((st[i][0] !== FISKAL_STATUS_.CEKA_JIR && !cekaMail) || !ids[i][0]) continue;
     provjereno++;
     var odg = fiskalZahtjev_('get', '/racun/' + ids[i][0]);
     if (odg.code !== 200) { greske.push('Redak ' + (i + 2) + ': ' + fiskalPorukaGreske_(odg).split('\n')[0]); continue; }
-    fiskalZapisiRacun_(sheet, i + 2, odg.json);
-    if (odg.json.jir) dovrseno++;
+    var r = odg.json;
+    fiskalZapisiRacun_(sheet, i + 2, r);
+    if (r.jir) dovrseno++;
+    if (r.poslanoEmail && cekaMail) {
+      // Poslan u međuvremenu (npr. iz dashboarda) → samo uskladi stupac
+      fiskalZapisiEmail_(sheet, i + 2, { ok: true, poruka: 'poslano na ' + r.poslanoEmail.na },
+        r.poslanoEmail.kada ? new Date(r.poslanoEmail.kada) : null);
+    } else if (fiskalTrebaAutoEmail_(r)) {
+      var rez = fiskalPosaljiEmailZaRedak_(sheet, i + 2, r.id);
+      if (rez.ok) poslano++;
+      else if (!rez.cekaJir) greske.push('Redak ' + (i + 2) + ' e-mail: ' + rez.poruka);
+    }
   }
-  ui.alert('🔄 Status', 'Čekalo JIR: ' + provjereno + '\nSada s JIR-om: ' + dovrseno +
+  ui.alert('🔄 Status', 'Provjereno: ' + provjereno + '\nSada s JIR-om: ' + dovrseno +
+    (CONFIG.FISKAL.AUTO_EMAIL ? '\nPoslano e-mailom: ' + poslano : '') +
     (greske.length ? '\n\n' + greske.join('\n') : ''), ui.ButtonSet.OK);
 }
 

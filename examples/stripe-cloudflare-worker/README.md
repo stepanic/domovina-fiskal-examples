@@ -60,7 +60,8 @@ vrati 200, a greška ide u log da je čovjek pogleda.
 + ZKI) i sam dovrši JIR. Spremi račun kao izdan i **ne izdaji novi**. E-mail s
 računom Fiskal šalje tek kad postoji JIR (inače `409 NEMA_JIR`), pa ga u tom
 slučaju pošalji iz svog crona: `GET /racun/:id` → kad ima `jir` →
-`POST /racun/:id/posalji`.
+`POST /racun/:id/posalji`. Ako kupac mora dobiti račun odmah, `posalji(id, { bezJir: true })`
+pošalje ga samo sa ZKI-jem, ali to je iznimka, ne zadano ponašanje.
 
 **Odgođena plaćanja.** Za SEPA i slične metode `checkout.session.completed`
 stiže s `payment_status: 'unpaid'`. Račun se tada izdaje tek na

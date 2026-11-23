@@ -73,6 +73,12 @@ npm run push -- <moj-event> prod --da-prod
 4. 📋 Dodaj stupce (OIB, Payment Type, `AKCIJA_RACUN`); stupce `Fiskal *`
    skripta dodaje sama kod prvog računa
 
+**E-mail kupcu** (`AUTO_EMAIL: true`): odmah nakon izdavanja, ako račun ima JIR.
+Ako račun čeka JIR, stupac „Fiskal E-mail” je žut („čeka JIR — mail ide nakon
+fiskalizacije”) i nije greška: 🔄 Osvježi status pošalje mail čim račun dobije
+JIR, i to točno jednom, jer Fiskal pamti `poslanoEmail`. Ručno ✉️ slanje računa
+bez JIR-a pita smije li ići samo sa ZKI-jem (`bezJir: true`).
+
 Ostalo u izborniku: Bulk (svi redci s Uplatom bez računa, u serijama od 4,5
 min zbog GAS limita), ✉️ Pošalji e-mailom, 🔄 Osvježi status (čeka JIR),
 ↩️ Storno 100 % / 50 %.

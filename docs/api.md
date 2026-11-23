@@ -112,7 +112,7 @@ curl -s -H "Authorization: Bearer $FISKAL_API_KEY" https://fiskal-test.domovina.
 | `GET /racun?vanjskaReferenca=…` | račun po tvojoj referenci, ili 404 |
 | `GET /racun?limit=&offset=` | popis |
 | `GET /racun/:id/pdf` | PDF; traži Bearer, javnog linka nema |
-| `POST /racun/:id/posalji` `{ "na"?: "…" }` | e-mail s PDF-om (default `kupac.email`); dok račun čeka JIR → `409`, `kod: "NEMA_JIR"` |
+| `POST /racun/:id/posalji` `{ "na"?: "…", "bezJir"?: true }` | e-mail s PDF-om (default `kupac.email`). `POST /racun` ga **ne** šalje sam. Dok fiskalni račun čeka JIR → `409`, `kod: "NEMA_JIR"`, osim uz `bezJir: true` (pošalji samo sa ZKI-jem, na izričit zahtjev). `GET /racun/:id` vraća `poslanoEmail: { kada, na }` ili `null` |
 | `POST /racun/:id/storno` `{ vanjskaReferenca?, napomena?, operaterOib?, stavke?: [{ redak, kolicina? }] }` | storno fiskalnog računa; bez `stavke` cijeli, sa `stavke` djelomični (npr. `kolicina: "0.5"`) |
 | `GET /postavke` | poslovni prostori, uređaji, operateri, PDV status |
 

@@ -52,8 +52,9 @@ var CONFIG = {
     // Idempotencija: <prefix>-<sha1(vremenska oznaka|email) prvih 16 hex>.
     // NE broj retka — redovi se smiju ručno premještati.
     REFERENCE_PREFIX: 'primjer27',
-    // Nakon izdavanja odmah POST /racun/:id/posalji na kupčev e-mail.
-    AUTO_EMAIL: false,
+    // Nakon izdavanja odmah POST /racun/:id/posalji na kupčev e-mail. Račun koji
+    // čeka JIR dobiva mail iz 🔄 Osvježi status kad CIS vrati JIR (jednom).
+    AUTO_EMAIL: true,
     // Link u stupcu „Fiskal Račun”: <host>/app/dashboard/racun?id=<id>
     // (dashboard ulogiranog tenanta). Prazno = host iz okoline.
     DASHBOARD_URL: ''
