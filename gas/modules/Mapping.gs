@@ -1,0 +1,1340 @@
+/**
+ * FIRA.finance Google Sheets Integration — Fiscal Invoice Version (v3)
+ *
+ * Triple-checked against FIRA Custom Webshop API v1.0.0 Swagger spec
+ * and official example payload from fira.finance.
+ *
+ * CHANGELOG v3:
+ * - UPLATA stupac je OBAVEZAN — nema default cijene
+ * - Validacija: UPLATA mora sadržavati iznos > 0 (najviše 2 decimale)
+ * - Info dialog ako UPLATA nije ispravno popunjena
+ *
+ * CHANGELOG v2 (triple-check fixes):
+ * - Dodano: webshopOrderNumber (fali u v1)
+ * - Dodano: paymentGatewayName (fali u v1)
+ * - Dodano: customerLocale (fali u v1)
+ * - Dodano: termsEN, termsDE za strane sudionike
+ * - Fix: dueDate postavljen na datum konferencije (prošlost), ne +14 dana
+ * - Fix: billingAddress ima sva polja iz Swagger spec-a (address2, company, vatNumber)
+ * - Fix: shippingAddress ima sva polja iz spec-a
+ * - Fix: lineItem.productCode dodan kao opcija
+ * - Dodano: napomena o barkodu — FIRA generira HUB-3A automatski,
+ *   za skrivanje treba u FIRA UI označiti račun kao plaćen
+ *   ili koristiti "Sakrij podatke za plaćanje" opciju
+ *
+ * PREDUVJETI ZA FISKALIZACIJU (u FIRA aplikaciji):
+ * 1. Aktiviran FIRA FISKAL paket
+ * 2. FINA certifikat uploadan: Postavke → Fiskalizacija
+ * 3. Poslovni prostor prijavljen Poreznoj upravi (ePorezna)
+ * 4. Interni akt napisan i arhiviran
+ *
+ * BARKOD ZA PLAĆANJE:
+ * FIRA automatski dodaje HUB-3A barkod na račune s HR IBAN-om.
+ * Za račune koji su VEĆ PLAĆENI (kao ovi za prošlu konferenciju):
+ *   1. U FIRA UI: označi račun kao "Plaćen"
+ *   2. FIRA ima opciju "Sakrij podatke za plaćanje" na plaćenim računima
+ *   3. Alternativno: u Settings → Webshop provjeri opcije za barkod
+ * Ovo se NE kontrolira kroz API, već kroz FIRA sučelje nakon kreiranja.
+ */
+
+// ============================================================================
+// KONFIGURACIJA — definirana u zasebnoj datoteci Config-Event-*.gs
+// ============================================================================
+// CONFIG objekt se učitava iz Config-Event-*.gs datoteke.
+// U GAS projektu smije biti SAMO JEDNA Config-Event-*.gs aktivna.
+// Za novi event: kopiraj Config-Event-*.gs, promijeni vrijednosti.
+
+// ============================================================================
+// MENU
+// ============================================================================
+
+function onOpen() {
+  var ui = SpreadsheetApp.getUi();
+  if (jeFiskal_()) {
+    ui.createMenu('🧾 Fiskal računi')
+      .addItem('🧾 Izdaj račun (odabrani redak)', 'createFiraInvoice')
+      .addItem('📦 Bulk: izdaj sve s uplatom', 'fiskalBulk')
+      .addSeparator()
+      .addItem('✉️ Pošalji račun e-mailom (odabrani redak)', 'fiskalPosaljiEmail')
+      .addItem('🔄 Osvježi status (čeka JIR)', 'fiskalOsvjeziStatuse')
+      .addItem('↩️ Storniraj račun — cijeli (100 %)', 'fiskalStornoCijeli')
+      .addItem('↩️ Storniraj račun — pola (50 %)', 'fiskalStorno50')
+      .addSeparator()
+      .addItem('⚙️ Postavi API ključ', 'setupFiraIntegration')
+      .addItem('ℹ️ Prikaži postavke', 'showConfiguration')
+      .addItem('📋 Dodaj stupce', 'addFiscalColumns')
+      .addItem('🔧 Instaliraj onEdit trigger', 'installTriggers')
+      .addSeparator()
+      .addItem('🔐 Autoriziraj dozvole (jednom)', 'authorizePermissions')
+      .addToUi();
+    return;
+  }
+  var isSplitEvent = !!(CONFIG && CONFIG.COLUMNS && CONFIG.COLUMNS.AKCIJA_AVANS);
+  var menu = ui.createMenu('FIRA Actions');
+
+  // Single-pay akcije — sakrij na split eventima da spriječiš krivi flow.
+  // Na split eventu sve ide kroz "FIRA Split Payment" menu (avans + finalni,
+  // a single-pay slučaj je AKCIJA_FINALNI_RACUN s avansom = 0).
+  if (!isSplitEvent) {
+    menu
+      .addItem('🧾 Napravi fiskalni račun (odabrani redak)', 'createFiraInvoice')
+      .addItem('📦 Bulk: fiskaliziraj sve označene', 'createFiraInvoicesBulk')
+      .addSeparator();
+  }
+
+  menu
+    .addItem('⚙️ Postavi API ključ', 'setupFiraIntegration')
+    .addItem('ℹ️ Prikaži postavke', 'showConfiguration')
+    .addItem('📋 Dodaj stupce za fiskalizaciju', 'addFiscalColumns')
+    .addItem('🔧 Instaliraj onEdit trigger', 'installTriggers')
+    .addSeparator()
+    .addItem('🔐 Autoriziraj dozvole (jednom)', 'authorizePermissions')
+    .addToUi();
+
+  // Optional: install split-payment menu ako je modul učitan u projektu
+  // (Code-Custom-SplitPayment.gs definira addSplitPaymentMenu)
+  try {
+    if (typeof addSplitPaymentMenu === 'function') addSplitPaymentMenu();
+  } catch (e) {
+    Logger.log('Split payment menu not loaded: ' + e.message);
+  }
+}
+
+// ============================================================================
+// INSTALLABLE TRIGGER — checkbox click
+// Pokreni "🔧 Instaliraj onEdit trigger" iz menija jednom (ili installTriggers
+// iz GAS editora). Apps Script API ne dopušta kreiranje triggera preko clasp-a.
+// ============================================================================
+
+function installTriggers() {
+  var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActive();
+  if (!ss) {
+    ui.alert('Otvori bound Sheet pa pokreni iz menija — installTriggers treba aktivni Spreadsheet.');
+    return;
+  }
+
+  var existing = ScriptApp.getProjectTriggers().filter(function(t) {
+    return t.getHandlerFunction() === 'onCheckboxEdit';
+  });
+  existing.forEach(function(t) { ScriptApp.deleteTrigger(t); });
+
+  ScriptApp.newTrigger('onCheckboxEdit')
+    .forSpreadsheet(ss)
+    .onEdit()
+    .create();
+
+  ui.alert('✅ Trigger instaliran',
+    'onCheckboxEdit aktivan na ovom Sheetu' +
+    (existing.length > 0 ? ' (' + existing.length + ' postojeći(h) zamijenjen(o))' : '') +
+    '.\n\nKlikni checkbox ' + CONFIG.COLUMNS.ACTION + ' za test.',
+    ui.ButtonSet.OK);
+}
+
+function onCheckboxEdit(e) {
+  if (!e || !e.range) return;
+
+  var sheet = e.range.getSheet();
+  if (CONFIG.SHEET_NAME && sheet.getName() !== CONFIG.SHEET_NAME) return;
+  var row = e.range.getRow();
+  var col = e.range.getColumn();
+
+  if (row <= 1) return;
+
+  // Dispatch to split-payment module ako je učitan i edit pripada AVANS/FINAL stupcu
+  try {
+    if (typeof dispatchSplitPaymentCheckbox === 'function'
+        && dispatchSplitPaymentCheckbox(e)) {
+      return;
+    }
+  } catch (err) {
+    Logger.log('Split payment dispatch error: ' + err.message);
+  }
+
+  var headers = getHeaders(sheet);
+  var actionCol = findColumnIndex(headers, CONFIG.COLUMNS.ACTION);
+
+  if (col !== actionCol || e.value !== 'TRUE') return;
+
+  // Guard: AKCIJA_FIRA_RACUN je ZABRANJEN na split-payment eventima.
+  // Sudionik bi dobio i avans + finalni račun (split flow) i jednokratni
+  // račun (ovaj flow) — knjigovodstveno duplo fakturirano.
+  if (CONFIG.COLUMNS.AKCIJA_AVANS) {
+    SpreadsheetApp.getUi().alert(
+      '⛔ Pogrešan checkbox za ovaj event',
+      'Ovaj event koristi split-payment flow (avans + finalni račun).\n\n' +
+      'KORISTI:\n' +
+      '  ✅ AKCIJA_AVANS_RACUN — kad sudionik plati avans\n' +
+      '  ✅ AKCIJA_FINALNI_RACUN — kad sudionik plati ostatak\n\n' +
+      'NE KORISTI:\n' +
+      '  ❌ AKCIJA_FIRA_RACUN — duplicirao bi račun (knjigovodstveni problem!)\n\n' +
+      'Stupac AKCIJA_FIRA_RACUN možeš ukloniti ručno (desni klik → Delete column)\n' +
+      'ili kroz FIRA Split Payment → "Ukloni AKCIJA_FIRA_RACUN stupac".',
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    e.range.setValue(false);
+    return;
+  }
+
+  var data = getRowDataAsMap(sheet, row, headers);
+  var name = data[CONFIG.COLUMNS.NAME] || 'N/A';
+  var email = data[CONFIG.COLUMNS.EMAIL] || 'N/A';
+  var paymentType = data[CONFIG.COLUMNS.PAYMENT_TYPE] || CONFIG.DEFAULT_PAYMENT_TYPE;
+  var oib = data[CONFIG.COLUMNS.OIB] || '';
+
+  // Validacija UPLATA — mora biti iznos > 0 (najviše 2 decimale)
+  var paymentRaw = data[CONFIG.COLUMNS.PAYMENT];
+  var paymentValidation = validatePaymentAmount(paymentRaw);
+
+  if (!paymentValidation.valid) {
+    SpreadsheetApp.getUi().alert(
+      'ℹ️ Nema evidentirane uplate',
+      paymentValidation.message + '\n\n' +
+      '👤 ' + name + '\n' +
+      '📧 ' + email + '\n\n' +
+      'Račun se ne može kreirati bez evidentirane uplate u stupcu UPLATA.',
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    e.range.setValue(false);
+    return;
+  }
+
+  var payment = paymentValidation.amount;
+
+  var ui = SpreadsheetApp.getUi();
+  if (jeFiskal_()) {
+    var okolina;
+    try { okolina = fiskalOkolina_(); }
+    catch (err) { ui.alert('❌ Okolina', err.message, ui.ButtonSet.OK); e.range.setValue(false); return; }
+    var potvrda = ui.alert(
+      'Izdaj ' + CONFIG.DEFAULT_INVOICE_TYPE + ' — ' + okolina.naziv.toUpperCase(),
+      '👤 ' + name + '\n' +
+      '🆔 OIB: ' + (oib || '(nije unesen)') + '\n' +
+      '💰 ' + payment + ' ' + CONFIG.DEFAULT_CURRENCY + '\n' +
+      '💳 ' + paymentType + '\n' +
+      '📧 ' + email + '\n\n' +
+      'Okolina: ' + fiskalOznakaOkoline_(okolina) + '\n' +
+      'Fiskalni račun ide u CIS i ne briše se (ispravak = storno).',
+      ui.ButtonSet.OK_CANCEL
+    );
+    if (potvrda !== ui.Button.OK) { e.range.setValue(false); return; }
+    try { createFiraInvoiceForRow(row, false, CONFIG.DEFAULT_INVOICE_TYPE); } catch (err) { /* prikazano u dijalogu */ }
+    return;
+  }
+
+  var result = ui.alert(
+    'Odaberi tip dokumenta',
+    '👤 ' + name + '\n' +
+    '🆔 OIB: ' + (oib || '(nije unesen)') + '\n' +
+    '💰 ' + payment + ' ' + CONFIG.DEFAULT_CURRENCY + '\n' +
+    '💳 ' + paymentType + '\n' +
+    '📧 ' + email + '\n\n' +
+    '── Odaberi tip ──\n' +
+    '✅ DA   → FISKALNI_RAČUN (šalje se Poreznoj upravi, NE briše se)\n' +
+    '🧪 NE   → RAČUN (običan, može se brisati u FIRA UI — za test/dev)\n' +
+    '✖️ ODUSTANI → otkaži',
+    ui.ButtonSet.YES_NO_CANCEL
+  );
+
+  var chosenType = null;
+  if (result === ui.Button.YES) chosenType = 'FISKALNI_RAČUN';
+  else if (result === ui.Button.NO) chosenType = 'RAČUN';
+
+  if (!chosenType) {
+    e.range.setValue(false);
+    return;
+  }
+
+  // Zapiši izbor u stupac Tip dokumenta (ako postoji) — audit trail + bulk consistency
+  var invoiceTypeCol = findColumnIndex(headers, CONFIG.COLUMNS.INVOICE_TYPE);
+  if (invoiceTypeCol !== -1) {
+    sheet.getRange(row, invoiceTypeCol).setValue(chosenType);
+  }
+
+  // Proslijedi izbor izravno — ne oslanjamo se samo na stupac jer ga možda nema
+  createFiraInvoiceForRow(row, false, chosenType);
+}
+
+// ============================================================================
+// SETUP FUNKCIJE
+// ============================================================================
+
+function authorizePermissions() {
+  var ui = SpreadsheetApp.getUi();
+  try {
+    var url = 'https://app.fira.finance';
+    if (jeFiskal_()) {
+      // Bilo koja Fiskal okolina — dozvola je za UrlFetch općenito
+      url = typeof OKOLINE !== 'undefined' ? OKOLINE[Object.keys(OKOLINE)[0]].fiskalBaseUrl : 'https://fiskal-test.domovina.ai/api/v1';
+    }
+    UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    ui.alert('✅ Autorizacija uspješna!', 'Sve dozvole odobrene.', ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('❌ Greška', 'Autorizacija nije uspjela: ' + e.message, ui.ButtonSet.OK);
+  }
+}
+
+function setupFiraIntegration() {
+  if (jeFiskal_()) return fiskalPostaviKljuc();
+  var ui = SpreadsheetApp.getUi();
+  var result = ui.prompt(
+    'FIRA API ključ',
+    'Unesite FIRA API ključ:\n(https://app.fira.finance/settings/integrations)',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (result.getSelectedButton() === ui.Button.OK) {
+    var apiKey = result.getResponseText().trim();
+    if (apiKey) {
+      PropertiesService.getScriptProperties().setProperty('FIRA_API_KEY', apiKey);
+      ui.alert('✅ API ključ spremljen!');
+    } else {
+      ui.alert('❌ API ključ ne može biti prazan');
+    }
+  }
+}
+
+function showConfiguration() {
+  if (jeFiskal_()) return fiskalPrikaziPostavke();
+  var apiKey = PropertiesService.getScriptProperties().getProperty('FIRA_API_KEY');
+  SpreadsheetApp.getUi().alert('Postavke',
+    'Usluga: ' + CONFIG.SERVICE_NAME + '\n' +
+    'Cijena: iz stupca UPLATA (obavezno)\n' +
+    'Mjesto: ' + CONFIG.DELIVERY_PLACE + '\n' +
+    'Tip (default): ' + CONFIG.DEFAULT_INVOICE_TYPE + '  (override: stupac "' + CONFIG.COLUMNS.INVOICE_TYPE + '")\n' +
+    'Plaćanje: ' + CONFIG.DEFAULT_PAYMENT_TYPE + '\n' +
+    'PDV: ' + (CONFIG.VAT_ENABLED ? 'Da' : 'Ne') + '\n' +
+    'Datum konf.: ' + CONFIG.CONFERENCE_DATE + '\n' +
+    'API: ' + (apiKey ? '***' + apiKey.slice(-4) : 'NIJE POSTAVLJEN') + '\n\n' +
+    '⚠️ BARKOD: Nakon kreiranja računa, u FIRA UI označite\n' +
+    'račun kao "Plaćen" da se sakrije barkod za plaćanje.',
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+/**
+ * Dodaj stupce OIB, Payment Type i AKCIJA checkboxove.
+ */
+function addFiscalColumns() {
+  var sheet = getRadniSheet_();
+  var headers = getHeaders(sheet);
+  var lastRow = sheet.getLastRow();
+  var addedColumns = [];
+
+  // Uplata stupac — organizator upisuje iznos po retku (npr. 50 ili 56.62)
+  if (findColumnIndex(headers, CONFIG.COLUMNS.PAYMENT) === -1) {
+    var payCol = sheet.getLastColumn() + 1;
+    sheet.getRange(1, payCol).setValue(CONFIG.COLUMNS.PAYMENT);
+    if (lastRow > 1) {
+      sheet.getRange(2, payCol, lastRow - 1, 1).setNumberFormat('0.00');
+    }
+    addedColumns.push(CONFIG.COLUMNS.PAYMENT);
+  }
+
+  // OIB stupac
+  headers = getHeaders(sheet);
+  if (findColumnIndex(headers, CONFIG.COLUMNS.OIB) === -1) {
+    var col = sheet.getLastColumn() + 1;
+    sheet.getRange(1, col).setValue(CONFIG.COLUMNS.OIB);
+    addedColumns.push('OIB');
+  }
+
+  // Payment Type stupac s dropdown validacijom
+  headers = getHeaders(sheet);
+  if (findColumnIndex(headers, CONFIG.COLUMNS.PAYMENT_TYPE) === -1) {
+    var ptCol = sheet.getLastColumn() + 1;
+    sheet.getRange(1, ptCol).setValue(CONFIG.COLUMNS.PAYMENT_TYPE);
+    if (lastRow > 1) {
+      var ptRange = sheet.getRange(2, ptCol, lastRow - 1, 1);
+      var defaults = [];
+      for (var i = 0; i < lastRow - 1; i++) defaults.push([CONFIG.DEFAULT_PAYMENT_TYPE]);
+      ptRange.setValues(defaults);
+      ptRange.setDataValidation(
+        SpreadsheetApp.newDataValidation()
+          .requireValueInList(jeFiskal_()
+            ? ['TRANSAKCIJSKI', 'GOTOVINA', 'KARTICA', 'OSTALO']
+            : ['TRANSAKCIJSKI', 'GOTOVINA', 'KARTICA'])
+          .setAllowInvalid(false)
+          .build()
+      );
+    }
+    addedColumns.push('Payment Type');
+  }
+
+  // Tip dokumenta stupac s dropdown validacijom (RAČUN | FISKALNI_RAČUN)
+  // Fiskal: uvijek CONFIG.DEFAULT_INVOICE_TYPE, stupac ne treba
+  headers = getHeaders(sheet);
+  if (!jeFiskal_() && findColumnIndex(headers, CONFIG.COLUMNS.INVOICE_TYPE) === -1) {
+    var itCol = sheet.getLastColumn() + 1;
+    sheet.getRange(1, itCol).setValue(CONFIG.COLUMNS.INVOICE_TYPE);
+    if (lastRow > 1) {
+      var itRange = sheet.getRange(2, itCol, lastRow - 1, 1);
+      itRange.setDataValidation(
+        SpreadsheetApp.newDataValidation()
+          .requireValueInList(['RAČUN', 'FISKALNI_RAČUN'])
+          .setAllowInvalid(false)
+          .build()
+      );
+    }
+    addedColumns.push('Tip dokumenta');
+  }
+
+  // AKCIJA_FIRA_RACUN checkbox — preskoči na split-payment eventima da
+  // se izbjegne knjigovodstveni dupli račun (avans+finalni VS jednokratni).
+  if (CONFIG.COLUMNS.AKCIJA_AVANS) {
+    addedColumns.push('(skipped AKCIJA_FIRA_RACUN — split-payment event)');
+  } else {
+    headers = getHeaders(sheet);
+    var actionColIdx = findColumnIndex(headers, CONFIG.COLUMNS.ACTION);
+    if (actionColIdx === -1) {
+      actionColIdx = sheet.getLastColumn() + 1;
+      sheet.getRange(1, actionColIdx).setValue(CONFIG.COLUMNS.ACTION);
+      addedColumns.push(CONFIG.COLUMNS.ACTION);
+    }
+    if (lastRow > 1) {
+      sheet.getRange(2, actionColIdx, lastRow - 1, 1).insertCheckboxes();
+    }
+  }
+
+  SpreadsheetApp.getUi().alert('Gotovo!',
+    addedColumns.length > 0
+      ? 'Dodani stupci: ' + addedColumns.join(', ') + '\n' +
+        (jeFiskal_() ? 'OIB je neobavezan (stranci ga nemaju).' : 'Popunite OIB kupaca prije fiskalizacije.')
+      : 'Svi stupci već postoje. Checkboxovi osvježeni.',
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+// ============================================================================
+// GLAVNE FUNKCIJE
+// ============================================================================
+
+function createFiraInvoice() {
+  var active = SpreadsheetApp.getActiveSheet();
+  if (active.getName() !== getRadniSheet_().getName()) {
+    SpreadsheetApp.getUi().alert('Odaberite redak na tabu "' + getRadniSheet_().getName() + '"');
+    return;
+  }
+  var row = active.getActiveRange().getRow();
+  if (row <= 1) {
+    SpreadsheetApp.getUi().alert('Odaberite redak s podacima (ne zaglavlje)');
+    return;
+  }
+  try { createFiraInvoiceForRow(row); } catch (e) { /* prikazano u dijalogu */ }
+}
+
+/**
+ * Bulk: fiskaliziraj sve retke s uključenim checkboxom koji nisu već SUCCESS.
+ */
+function createFiraInvoicesBulk() {
+  if (jeFiskal_()) return fiskalBulk();
+  var ui = SpreadsheetApp.getUi();
+  var sheet = getRadniSheet_();
+  var headers = getHeaders(sheet);
+  var actionCol = findColumnIndex(headers, CONFIG.COLUMNS.ACTION);
+  var statusCol = findColumnIndex(headers, 'FIRA Status');
+  var paymentCol = findColumnIndex(headers, CONFIG.COLUMNS.PAYMENT);
+
+  if (actionCol === -1) {
+    ui.alert('Stupac AKCIJA_FIRA_RACUN ne postoji. Koristite "Dodaj stupce za fiskalizaciju".');
+    return;
+  }
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return;
+
+  var actionValues = sheet.getRange(2, actionCol, lastRow - 1, 1).getValues();
+  var rowsToProcess = [];
+  var skippedNoPayment = [];
+
+  for (var i = 0; i < actionValues.length; i++) {
+    if (actionValues[i][0] !== true) continue;
+    var rowNum = i + 2;
+
+    // Preskoči već uspješno obrađene
+    if (statusCol !== -1) {
+      var currentStatus = sheet.getRange(rowNum, statusCol).getValue();
+      if (currentStatus === 'SUCCESS') continue;
+    }
+
+    // Provjeri UPLATA prije dodavanja u listu
+    if (paymentCol !== -1) {
+      var paymentRaw = sheet.getRange(rowNum, paymentCol).getValue();
+      var pv = validatePaymentAmount(paymentRaw);
+      if (!pv.valid) {
+        var rowName = sheet.getRange(rowNum, findColumnIndex(headers, CONFIG.COLUMNS.NAME)).getValue() || 'Redak ' + rowNum;
+        skippedNoPayment.push(rowName);
+        sheet.getRange(rowNum, actionCol).setValue(false);
+        continue;
+      }
+    }
+
+    rowsToProcess.push(rowNum);
+  }
+
+  // Obavijesti o preskočenima bez uplate
+  if (skippedNoPayment.length > 0) {
+    ui.alert(
+      'ℹ️ Preskočeni redci bez evidentirane uplate',
+      'Sljedeći sudionici nemaju valjanu uplatu u stupcu UPLATA\n' +
+      'i neće biti uključeni u bulk obradu:\n\n' +
+      skippedNoPayment.join('\n') + '\n\n' +
+      'Unesite iznos uplate (npr. 40 ili 56.62) pa pokušajte ponovo.',
+      ui.ButtonSet.OK
+    );
+  }
+
+  if (rowsToProcess.length === 0) {
+    if (skippedNoPayment.length === 0) {
+      ui.alert('Nema označenih neobrađenih redaka.');
+    }
+    return;
+  }
+
+  // Prebroji tipove dokumenta iz stupca (fallback na CONFIG default)
+  var invoiceTypeCol = findColumnIndex(headers, CONFIG.COLUMNS.INVOICE_TYPE);
+  var fiscalCount = 0, regularCount = 0;
+  for (var k = 0; k < rowsToProcess.length; k++) {
+    var t = invoiceTypeCol !== -1
+      ? (sheet.getRange(rowsToProcess[k], invoiceTypeCol).getValue() || CONFIG.DEFAULT_INVOICE_TYPE)
+      : CONFIG.DEFAULT_INVOICE_TYPE;
+    if (t === 'FISKALNI_RAČUN') fiscalCount++; else regularCount++;
+  }
+
+  var confirm = ui.alert(
+    'Bulk obrada — ' + rowsToProcess.length + ' računa',
+    'Kreirat će se ' + rowsToProcess.length + ' dokumenata:\n' +
+    '  🧾 FISKALNI_RAČUN: ' + fiscalCount + '  (NE briše se, šalje se Poreznoj)\n' +
+    '  📄 RAČUN: ' + regularCount + '  (običan, može se brisati u FIRA UI)\n\n' +
+    'Tip se kontrolira stupcem "' + CONFIG.COLUMNS.INVOICE_TYPE + '" — provjeri prije nastavka.\n\n' +
+    '💡 Nakon kreiranja, fiskalne označite u FIRA UI kao "Plaćen" da se sakrije barkod.',
+    ui.ButtonSet.YES_NO
+  );
+  if (confirm !== ui.Button.YES) return;
+
+  var successCount = 0;
+  var errorCount = 0;
+
+  for (var j = 0; j < rowsToProcess.length; j++) {
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      (j + 1) + '/' + rowsToProcess.length + '...', 'Bulk', -1);
+    try {
+      createFiraInvoiceForRow(rowsToProcess[j], true);
+      successCount++;
+    } catch (e) {
+      Logger.log('Row ' + rowsToProcess[j] + ' error: ' + e.message);
+      errorCount++;
+    }
+    // Pauza 1.5s između API poziva da ne preopteretimo FIRA
+    if (j < rowsToProcess.length - 1) Utilities.sleep(1500);
+  }
+
+  ui.alert('Bulk završen',
+    '✅ Uspješno: ' + successCount + '\n❌ Greške: ' + errorCount +
+    '\n\nProvjerite stupac "FIRA Status".\n\n' +
+    '💡 U FIRA UI označite račune kao "Plaćen" da se sakrije barkod.',
+    ui.ButtonSet.OK
+  );
+}
+
+/**
+ * Core: kreiraj FIRA račun za jedan redak.
+ * @param {number} row - Broj retka (1-indexed)
+ * @param {boolean} [suppressDialogs=false] - Bez UI dijaloga (za bulk)
+ * @param {string} [invoiceTypeOverride] - 'RAČUN' | 'FISKALNI_RAČUN' (override stupca i CONFIG default)
+ */
+function createFiraInvoiceForRow(row, suppressDialogs, invoiceTypeOverride) {
+  if (jeFiskal_()) return izdajFiskalniZaRedak_(row, suppressDialogs, invoiceTypeOverride);
+  var ui = SpreadsheetApp.getUi();
+  var sheet = getRadniSheet_();
+
+  var apiKey = PropertiesService.getScriptProperties().getProperty('FIRA_API_KEY');
+  if (!apiKey) {
+    if (!suppressDialogs) ui.alert('Postavite FIRA API ključ: FIRA Actions → Postavi API ključ');
+    throw new Error('FIRA API ključ nije postavljen');
+  }
+
+  var headers = getHeaders(sheet);
+
+  try {
+    SpreadsheetApp.getActiveSpreadsheet().toast('Fiskaliziram...', 'FIRA', -1);
+
+    var rowData = sheet.getRange(row, 1, 1, sheet.getLastColumn()).getValues()[0];
+    var payload = buildPayload(headers, rowData, invoiceTypeOverride);
+
+    var validation = validatePayload(payload);
+    if (!validation.valid) {
+      markRowAsProcessed(sheet, row, 'GREŠKA: ' + validation.error, new Date(), null);
+      uncheckActionCheckbox(sheet, row, headers);
+      if (!suppressDialogs) ui.alert('Validacija', validation.error, ui.ButtonSet.OK);
+      throw new Error(validation.error);
+    }
+
+    Logger.log('FIRA Payload:\n' + JSON.stringify(payload, null, 2));
+
+    var response = sendToFira(payload, apiKey);
+    var documentUrl = buildDocumentUrl(response, payload.invoiceType);
+
+    markRowAsProcessed(sheet, row, 'SUCCESS', new Date(), documentUrl);
+
+    var isFiscal = payload.invoiceType === 'FISKALNI_RAČUN';
+    var successTitle = isFiscal ? '✅ Fiskalni račun kreiran!' : '✅ Račun kreiran!';
+    var successBody = isFiscal
+      ? 'FIRA će fiskalizirati prema Poreznoj upravi (JIR + ZKI).\n\n' +
+        '💡 Za skrivanje barkoda:\nU FIRA UI označite račun kao "Plaćen".'
+      : 'Običan RAČUN — može se obrisati u FIRA dashboardu.\n\n' +
+        '💡 Za produkciju odaberi FISKALNI_RAČUN u promptu.';
+
+    if (!suppressDialogs) {
+      ui.alert(successTitle, successBody, ui.ButtonSet.OK);
+    }
+
+    SpreadsheetApp.getActiveSpreadsheet().toast(successTitle, 'FIRA', 5);
+
+  } catch (error) {
+    Logger.log('═══════════════════════════════════════════');
+    Logger.log('❌ GREŠKA ZA REDAK ' + row);
+    Logger.log('═══════════════════════════════════════════');
+    Logger.log('Error message: ' + error.message);
+    Logger.log('Error stack: ' + (error.stack || 'N/A'));
+    Logger.log('═══════════════════════════════════════════');
+
+    markRowAsProcessed(sheet, row, 'GREŠKA: ' + error.message, new Date(), null);
+    uncheckActionCheckbox(sheet, row, headers);
+
+    if (!suppressDialogs) {
+      ui.alert('❌ Greška — redak ' + row, error.message, ui.ButtonSet.OK);
+    }
+    throw error;
+  }
+}
+
+// ============================================================================
+// PAYMENT VALIDATION
+// ============================================================================
+
+/**
+ * Pretvori vrijednost ćelije u iznos (broj s najviše 2 decimale).
+ * Prihvaća broj iz Sheetsa ili tekst s decimalnim zarezom ("56,62").
+ *
+ * @param {*} rawValue
+ * @returns {number} iznos zaokružen na cente, NaN ako nije broj
+ *   ili ima više od 2 decimale
+ */
+function parseMoneyAmount_(rawValue) {
+  var num = toNumber_(rawValue);
+  if (isNaN(num)) return NaN;
+  var cents = Math.round(num * 100);
+  // Tolerancija za float šum iz Sheetsa (npr. 56.620000000001)
+  if (Math.abs(num * 100 - cents) > 1e-6) return NaN;
+  return cents / 100;
+}
+
+/** Broj iz ćelije; tekst smije imati decimalni zarez i razmake. */
+function toNumber_(rawValue) {
+  return typeof rawValue === 'string'
+    ? Number(rawValue.replace(/\s/g, '').replace(',', '.'))
+    : Number(rawValue);
+}
+
+function isMoneyAmount_(n) {
+  return typeof n === 'number' && !isNaN(n) && Math.abs(n * 100 - Math.round(n * 100)) < 1e-6;
+}
+
+/**
+ * Provjeri da UPLATA stupac sadrži valjani iznos > 0 (najviše 2 decimale).
+ *
+ * @param {*} rawValue - Vrijednost iz stupca UPLATA
+ * @returns {{ valid: boolean, amount?: number, message?: string }}
+ */
+function validatePaymentAmount(rawValue) {
+  // Prazna ćelija ili null/undefined
+  if (rawValue === null || rawValue === undefined || rawValue === '') {
+    return {
+      valid: false,
+      message: 'Stupac UPLATA je prazan.\n\n' +
+        'Ne postoji evidentirana uplata na temelju koje se može izdati račun.\n' +
+        'Unesite iznos uplate (npr. 40 ili 56.62) prije kreiranja računa.'
+    };
+  }
+
+  // Nije broj uopće (tekst, specijalnih znakovi...)
+  if (isNaN(toNumber_(rawValue))) {
+    return {
+      valid: false,
+      message: 'Stupac UPLATA sadrži "' + rawValue + '" — nije broj.\n\n' +
+        'Ne postoji evidentirana uplata na temelju koje se može izdati račun.\n' +
+        'Unesite iznos uplate (npr. 40 ili 56.62).'
+    };
+  }
+
+  var num = parseMoneyAmount_(rawValue);
+
+  // Više od 2 decimale (npr. 40.505)
+  if (isNaN(num)) {
+    return {
+      valid: false,
+      message: 'Stupac UPLATA sadrži ' + rawValue + ' — najviše 2 decimale.\n\n' +
+        'Unesite iznos uplate u eurima i centima (npr. 56.62).'
+    };
+  }
+
+  // Nula ili negativan
+  if (num <= 0) {
+    return {
+      valid: false,
+      message: 'Stupac UPLATA sadrži ' + num + ' — mora biti pozitivan iznos.\n\n' +
+        'Ne postoji evidentirana uplata na temelju koje se može izdati račun.\n' +
+        'Unesite stvarni iznos uplate (npr. 40 ili 56.62).'
+    };
+  }
+
+  return { valid: true, amount: num };
+}
+
+// ============================================================================
+// PAYLOAD BUILDER — triple-checked against Swagger spec v1.0.0
+// ============================================================================
+
+/**
+ * Map sheet row to FIRA API payload.
+ *
+ * Polja uključena prema Swagger specu (WebshopOrderModel):
+ * ✅ webshopOrderId      — random unique ID
+ * ✅ webshopType          — "CUSTOM"
+ * ✅ webshopEvent         — event description
+ * ✅ webshopOrderNumber   — human-readable order number (NOVO!)
+ * ✅ invoiceType          — "FISKALNI_RAČUN"
+ * ✅ paymentGatewayCode   — gateway identifier
+ * ✅ paymentGatewayName   — gateway display name (NOVO!)
+ * ✅ createdAt            — ISO datetime "YYYY-MM-DDTHH:mm:ssZ"
+ * ✅ dueDate              — ISO date "YYYY-MM-DD" (datum konferencije, NE +14 dana)
+ * ✅ currency             — "EUR"
+ * ✅ taxesIncluded        — false (udruga nije u PDV-u)
+ * ✅ billingAddress       — kompletni objekt sa svim poljima iz spec-a
+ * ✅ shippingAddress      — delivery place
+ * ✅ taxValue, brutto, netto
+ * ✅ lineItems            — s kpdCode i productCode
+ * ✅ discounts            — prazan array
+ * ✅ customerLocale       — "HR" (NOVO!)
+ * ✅ internalNote         — max 250 chars, NE vidi se na PDF-u
+ * ✅ paymentType          — iz sheet stupca ili CONFIG default
+ * ✅ termsHR              — klauzule vidljive na HR PDF-u (DORAĐENO!)
+ * ✅ termsEN              — za strane sudionike (NOVO!)
+ * ✅ termsDE              — za DE/AT sudionike (NOVO!)
+ */
+function buildPayload(headers, rowData, invoiceTypeOverride) {
+  var data = mapHeadersToValues(headers, rowData);
+
+  var email = getVal(data, CONFIG.COLUMNS.EMAIL);
+  var name = getVal(data, CONFIG.COLUMNS.NAME);
+  var cityCountry = getVal(data, CONFIG.COLUMNS.CITY_COUNTRY);
+  var phone = getVal(data, CONFIG.COLUMNS.PHONE);
+  var gender = getVal(data, CONFIG.COLUMNS.GENDER);
+  var yearOfBirth = getVal(data, CONFIG.COLUMNS.YEAR_OF_BIRTH);
+  var occupation = getVal(data, CONFIG.COLUMNS.OCCUPATION);
+  var oib = getVal(data, CONFIG.COLUMNS.OIB);
+  var paymentType = getVal(data, CONFIG.COLUMNS.PAYMENT_TYPE) || CONFIG.DEFAULT_PAYMENT_TYPE;
+  // Prioritet: eksplicitan override (iz prompt-a) → stupac Tip dokumenta → CONFIG default
+  var invoiceType = invoiceTypeOverride || getVal(data, CONFIG.COLUMNS.INVOICE_TYPE) || CONFIG.DEFAULT_INVOICE_TYPE;
+
+  // UPLATA — obavezna, validira se prije poziva buildPayload,
+  // ali radimo dodatnu provjeru za sigurnost
+  var paymentRaw = data[CONFIG.COLUMNS.PAYMENT];
+  var paymentValidation = validatePaymentAmount(paymentRaw);
+  if (!paymentValidation.valid) {
+    throw new Error(paymentValidation.message);
+  }
+  var payment = paymentValidation.amount;
+
+  var location = parseCityAndCountry(cityCountry);
+
+  // Per-row TERMIN override (no-op ako event nema CONFIG.TERMIN_OVERRIDES)
+  var termin = resolveTerminOverride_(data);
+
+  // VAT izračun
+  var taxRate = CONFIG.VAT_ENABLED ? CONFIG.DEFAULT_TAX_RATE : 0;
+  var netto = payment;
+  var taxValue = CONFIG.VAT_ENABLED ? netto * taxRate : 0;
+  var brutto = netto + taxValue;
+
+  // Vrijeme kreiranja = sada, ali dueDate = datum konferencije (PROŠLOST)
+  var now = new Date();
+  var orderId = Math.floor(Math.random() * 9000000) + 1000000; // 7-digit unique
+
+  // Internal note — max 250 chars, nevidljiva na PDF-u
+  var internalNote = buildInternalNote(gender, yearOfBirth, occupation);
+
+  // Line item
+  var lineItem = {
+    name: termin.serviceName,
+    description: 'Registracija sudionika: ' + name,
+    price: payment,
+    quantity: 1,
+    unit: 'usluga',
+    taxRate: taxRate
+  };
+  // Opcioni KPD kod (obavezno za eRačune od 2026.)
+  if (CONFIG.DEFAULT_KPD_CODE) {
+    lineItem.kpdCode = CONFIG.DEFAULT_KPD_CODE;
+  }
+
+  // Kompletni payload — sve polje iz WebshopOrderModel
+  return {
+    // Identifikacija narudžbe
+    webshopOrderId: orderId,
+    webshopType: 'CUSTOM',
+
+    // Tip dokumenta — per-row override iz stupca Tip dokumenta, fallback na CONFIG default
+    invoiceType: invoiceType,
+
+    // Payment gateway
+    paymentGatewayCode: CONFIG.PAYMENT_GATEWAY_CODE,
+    paymentGatewayName: CONFIG.PAYMENT_GATEWAY_NAME,
+
+    // Datumi — dueDate je datum KONFERENCIJE jer je račun već plaćen
+    createdAt: formatDateTimeForFira(now),
+
+    // Valuta i PDV
+    currency: CONFIG.DEFAULT_CURRENCY,
+    taxesIncluded: CONFIG.VAT_ENABLED,
+
+    // Kupac — sva polja prema Swagger WebshopCustomerAddressModel
+    billingAddress: {
+      name: name,
+      address1: '',
+      address2: '',
+      city: location.city,
+      country: location.country,
+      phone: phone,
+      zipCode: '',
+      email: email,
+      vatNumber: '',
+      company: '',
+      oib: oib
+    },
+
+    // Dostava — FIRA koristi shippingAddress.city kao "Mjesto isporuke" na PDF-u
+    shippingAddress: {
+      name: name,
+      address1: '',
+      address2: '',
+      city: termin.deliveryPlace,
+      country: 'HR',
+      phone: '',
+      zipCode: '',
+      email: ''
+    },
+
+    // Iznosi
+    taxValue: roundTwo(taxValue),
+    brutto: roundTwo(brutto),
+    netto: roundTwo(netto),
+
+    // Stavke
+    lineItems: [lineItem],
+    discounts: [],
+
+    // Locale za kupca
+    // customerLocale prati istu trihotomiju kao FIRA odabir terms jezika:
+    //   HR → 'HR', AT/DE → 'DE', sve ostalo → 'EN'
+    customerLocale: localeForCountry(location.country),
+
+    // Interna bilješka (nevidljiva na PDF-u)
+    internalNote: internalNote,
+
+    // Način plaćanja
+    paymentType: paymentType,
+
+    // Klauzule vidljive na PDF-u — FIRA bira po billingAddress.country:
+    //   HR → termsHR, DE/AT → termsDE, ostalo → termsEN
+    termsHR: CONFIG.TERMS_HR,
+    termsEN: CONFIG.TERMS_EN,
+    termsDE: CONFIG.TERMS_DE
+  };
+}
+
+// ============================================================================
+// VALIDATION — za fiskalne račune
+// ============================================================================
+
+function validatePayload(payload) {
+  var errors = [];
+
+  if (!payload.lineItems || payload.lineItems.length === 0) {
+    errors.push('Potrebna barem jedna stavka');
+  }
+  if (!payload.billingAddress.name) {
+    errors.push('Ime i prezime obavezno');
+  }
+  if (!payload.billingAddress.email) {
+    errors.push('Email obavezan');
+  }
+
+  // UPLATA validacija — već provjereno u buildPayload i onCheckboxEdit,
+  // ali za sigurnost provjeravamo i ovdje
+  if (payload.lineItems && payload.lineItems[0]) {
+    var price = payload.lineItems[0].price;
+    if (price === null || price === undefined || price <= 0) {
+      errors.push('Stupac UPLATA: ne postoji evidentirana uplata na temelju koje se može izdati račun');
+    }
+    if (!isMoneyAmount_(price)) {
+      errors.push('Stupac UPLATA: iznos smije imati najviše 2 decimale (npr. 56.62)');
+    }
+  }
+
+  // Validacija specifična za fiskalne račune
+  if (payload.invoiceType === 'FISKALNI_RAČUN') {
+    if (['GOTOVINA', 'TRANSAKCIJSKI', 'KARTICA'].indexOf(payload.paymentType) === -1) {
+      errors.push('Način plaćanja mora biti GOTOVINA, TRANSAKCIJSKI ili KARTICA');
+    }
+    // OIB info — od 2026. obavezan za B2C, ali ne blokiramo (FIRA validira)
+    if (!payload.billingAddress.oib) {
+      Logger.log('⚠️ OIB nije unesen za redak — FIRA može tražiti od 2026.');
+    }
+  }
+
+  return errors.length > 0
+    ? { valid: false, error: errors.join('\n') }
+    : { valid: true };
+}
+
+// ============================================================================
+// FIRA API KOMUNIKACIJA
+// ============================================================================
+
+/**
+ * POST na FIRA Custom Webshop API.
+ * Endpoint: /api/v1/webshop/order/custom
+ * Auth: FIRA-Api-Key header
+ * Body: JSON payload
+ */
+function sendToFira(payload, apiKey) {
+  var url = 'https://app.fira.finance/api/v1/webshop/order/custom';
+  var jsonPayload = JSON.stringify(payload);
+
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'FIRA-Api-Key': apiKey },
+    payload: jsonPayload,
+    muteHttpExceptions: true
+  };
+
+  // Logiraj kompletni request za debugging
+  Logger.log('═══════════════════════════════════════════');
+  Logger.log('FIRA REQUEST');
+  Logger.log('═══════════════════════════════════════════');
+  Logger.log('URL: ' + url);
+  Logger.log('invoiceType: ' + payload.invoiceType);
+  Logger.log('paymentType: ' + payload.paymentType);
+  Logger.log('billingAddress.name: ' + payload.billingAddress.name);
+  Logger.log('billingAddress.email: ' + payload.billingAddress.email);
+  Logger.log('billingAddress.country: ' + payload.billingAddress.country);
+  Logger.log('billingAddress.oib: ' + (payload.billingAddress.oib || '(prazno)'));
+  Logger.log('brutto: ' + payload.brutto + ' | netto: ' + payload.netto + ' | tax: ' + payload.taxValue);
+  Logger.log('lineItems[0].price: ' + (payload.lineItems[0] ? payload.lineItems[0].price : 'N/A'));
+  Logger.log('lineItems[0].taxRate: ' + (payload.lineItems[0] ? payload.lineItems[0].taxRate : 'N/A'));
+  Logger.log('customerLocale: ' + payload.customerLocale);
+  Logger.log('───────────────────────────────────────────');
+  Logger.log('FULL PAYLOAD:\n' + JSON.stringify(payload, null, 2));
+  Logger.log('───────────────────────────────────────────');
+
+  var response = UrlFetchApp.fetch(url, options);
+  var code = response.getResponseCode();
+  var body = response.getContentText();
+  var responseHeaders = response.getHeaders();
+
+  // Logiraj kompletni response
+  Logger.log('═══════════════════════════════════════════');
+  Logger.log('FIRA RESPONSE');
+  Logger.log('═══════════════════════════════════════════');
+  Logger.log('HTTP Status: ' + code);
+  Logger.log('Content-Type: ' + (responseHeaders['Content-Type'] || 'N/A'));
+  Logger.log('Response Body:\n' + body);
+  Logger.log('═══════════════════════════════════════════');
+
+  if (code === 200) {
+    Logger.log('✅ SUCCESS — ID: ' + JSON.parse(body).id);
+    return JSON.parse(body);
+  }
+
+  // Parsiraj error body za maksimalno detaljan opis
+  var parsedError = parseFiraError(body);
+
+  // Deskriptivne greške za svaki HTTP status — s punim response bodyem
+  var friendlyMessages = {
+    400: 'Neispravni podaci',
+    401: 'Autentifikacija neuspjela — provjeri API ključ',
+    402: 'FIRA paket neaktivan ili nedovoljno kredita',
+    403: 'Nema dozvole — provjeri FIRA FISKAL postavke i certifikat',
+    404: 'Endpoint nije pronađen',
+    500: 'FIRA server greška'
+  };
+  var friendly = friendlyMessages[code] || 'HTTP ' + code;
+
+  // Kompletna error poruka — uključuje i parsed error i raw body
+  var fullError = friendly + '\n\n' +
+    '── Parsed error ──\n' + parsedError + '\n\n' +
+    '── Raw response (HTTP ' + code + ') ──\n' + body;
+
+  Logger.log('❌ ERROR DETAILS:\n' + fullError);
+
+  throw new Error(fullError);
+}
+
+/**
+ * Parsiraj FIRA error response — pokriva više formata:
+ * - { validationErrors: [{ fieldName, message, rejectedValue }] }
+ * - { message: "...", details: "..." }
+ * - { error: "...", status: 500 }
+ * - plain text
+ */
+function parseFiraError(body) {
+  try {
+    var err = JSON.parse(body);
+
+    var parts = [];
+
+    // Validation errors array (400 greške)
+    if (err.validationErrors && err.validationErrors.length > 0) {
+      parts.push('Validation errors:');
+      err.validationErrors.forEach(function(ve, i) {
+        parts.push('  [' + (i + 1) + '] ' +
+          'field: ' + (ve.fieldName || '?') +
+          ' | message: ' + (ve.message || '?') +
+          ' | rejected: ' + (ve.rejectedValue !== undefined ? JSON.stringify(ve.rejectedValue) : 'N/A'));
+      });
+    }
+
+    // Top-level message/error/details
+    if (err.message) parts.push('Message: ' + err.message);
+    if (err.error) parts.push('Error: ' + err.error);
+    if (err.details) parts.push('Details: ' + err.details);
+    if (err.status) parts.push('Status: ' + err.status);
+    if (err.path) parts.push('Path: ' + err.path);
+    if (err.timestamp) parts.push('Timestamp: ' + err.timestamp);
+
+    // Ako smo pronašli nešto korisno
+    if (parts.length > 0) return parts.join('\n');
+
+    // Fallback: cijeli JSON objekt
+    return JSON.stringify(err, null, 2);
+  } catch (e) {
+    // Nije JSON — vrati raw text
+    return '(non-JSON response): ' + body;
+  }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * Tab na kojem skripta radi: CONFIG.SHEET_NAME ako je zadan (Sheet ima i
+ * druge tabove, npr. ručno premještene retke bez headera), inače aktivni.
+ */
+function getRadniSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  if (!CONFIG.SHEET_NAME) return ss.getActiveSheet();
+  var sh = ss.getSheetByName(CONFIG.SHEET_NAME);
+  if (!sh) throw new Error('Nema taba "' + CONFIG.SHEET_NAME + '" (CONFIG.SHEET_NAME)');
+  return sh;
+}
+
+function getHeaders(sheet) {
+  return sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+}
+
+function findColumnIndex(headers, name) {
+  for (var i = 0; i < headers.length; i++) {
+    if (headers[i] === name) return i + 1;
+  }
+  return -1;
+}
+
+function getRowDataAsMap(sheet, row, headers) {
+  var vals = sheet.getRange(row, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var map = {};
+  headers.forEach(function(h, i) { map[h] = vals[i]; });
+  return map;
+}
+
+function mapHeadersToValues(headers, rowData) {
+  var map = {};
+  headers.forEach(function(h, i) { map[h] = rowData[i]; });
+  return map;
+}
+
+function getVal(data, key, def) {
+  var v = data[key];
+  return (v !== undefined && v !== null && v !== '') ? v : (def || '');
+}
+
+/**
+ * Per-row override za eventove koji kroz JEDNU formu primaju prijave na
+ * VIŠE termina/lokacija (npr. cunski-2026: Termin I/II u Ćunskim + Termin III na Krku).
+ *
+ * Vraća { serviceName, deliveryPlace, conferenceDate } — uvijek popunjeno,
+ * fallback na CONFIG defaults. No-op (vraća samo defaults) ako CONFIG nema
+ * TERMIN_OVERRIDES ili COLUMNS.TERMIN — pa je siguran za sve eventove.
+ *
+ * Match strategija:
+ *   1. EXACT na raw vrijednost (Google Forms čuva original whitespace)
+ *   2. Normalized (trim + collapse whitespace) — tolerira sitne varijante
+ */
+function resolveTerminOverride_(data) {
+  var result = {
+    serviceName: CONFIG.SERVICE_NAME,
+    deliveryPlace: CONFIG.DELIVERY_PLACE,
+    conferenceDate: CONFIG.CONFERENCE_DATE
+  };
+  if (!CONFIG.TERMIN_OVERRIDES || !CONFIG.COLUMNS.TERMIN) return result;
+  var raw = data[CONFIG.COLUMNS.TERMIN];
+  if (!raw) return result;
+
+  var override = CONFIG.TERMIN_OVERRIDES[raw];
+  if (!override) {
+    var normalized = String(raw).trim().replace(/\s+/g, ' ');
+    for (var k in CONFIG.TERMIN_OVERRIDES) {
+      if (k.trim().replace(/\s+/g, ' ') === normalized) {
+        override = CONFIG.TERMIN_OVERRIDES[k];
+        break;
+      }
+    }
+  }
+  if (override) {
+    if (override.serviceName)    result.serviceName    = override.serviceName;
+    if (override.deliveryPlace)  result.deliveryPlace  = override.deliveryPlace;
+    if (override.conferenceDate) result.conferenceDate = override.conferenceDate;
+  }
+  return result;
+}
+
+function roundTwo(n) {
+  return Math.round(n * 100) / 100;
+}
+
+function uncheckActionCheckbox(sheet, row, headers) {
+  var col = findColumnIndex(headers, CONFIG.COLUMNS.ACTION);
+  if (col !== -1) sheet.getRange(row, col).setValue(false);
+}
+
+function buildDocumentUrl(response, invoiceType) {
+  var base = 'https://app.fira.finance/user/';
+  if (invoiceType === 'PONUDA') return base + 'offers/details/' + response.id;
+  return base + 'invoices/details/' + response.id;
+}
+
+function buildInternalNote(gender, yearOfBirth, occupation) {
+  var parts = [
+    'Google Forms',
+    gender || null,
+    yearOfBirth ? 'r.' + yearOfBirth : null,
+    occupation || null
+  ].filter(Boolean);
+
+  var note = parts.join(' | ');
+  if (note.length > CONFIG.MAX_INTERNAL_NOTE_LENGTH) {
+    note = note.substring(0, CONFIG.MAX_INTERNAL_NOTE_LENGTH - 3) + '...';
+  }
+  return note;
+}
+
+// ============================================================================
+// PARSIRANJE PODATAKA
+// ============================================================================
+
+/**
+ * "Zagreb, Croatia" → { city: "Zagreb", country: "HR" }
+ *
+ * Slobodan tekst iz forme, pa redom:
+ *   1. segmenti po zarezu OD ZADNJEG: kratki kod (HR, USA, BiH…) samo kao
+ *      cijeli segment, naziv države kao početak riječi (Lithuania, Njemačka…)
+ *   2. ako nijedan segment nije država (npr. "Germany Augsburg") — traži
+ *      naziv države bilo gdje u tekstu (riječ po riječ)
+ *   3. poznati grad (Sarajevo → BA, Wien → AT…)
+ *   4. CONFIG.DEFAULT_COUNTRY
+ * Grad = prvi segment koji nije država; ako je država u istom segmentu
+ * (bez zareza), riječi države se izbace.
+ *
+ * Kod FIRA-e je kriva država kvarila samo jezik uvjeta; u Fiskalu ide na
+ * račun (kupac.adresa.drzava) — zato je ovo bitno.
+ */
+var KODOVI_DRZAVA_ = {
+  hr: 'HR', cro: 'HR', de: 'DE', ger: 'DE', at: 'AT', aut: 'AT', si: 'SI', slo: 'SI',
+  rs: 'RS', srb: 'RS', ba: 'BA', bih: 'BA', it: 'IT', ita: 'IT', hu: 'HU', cz: 'CZ',
+  sk: 'SK', pl: 'PL', ro: 'RO', fr: 'FR', es: 'ES', pt: 'PT', nl: 'NL', be: 'BE',
+  ch: 'CH', uk: 'GB', gb: 'GB', ie: 'IE', us: 'US', usa: 'US', ca: 'CA', au: 'AU',
+  br: 'BR', me: 'ME', mk: 'MK', mkd: 'MK', al: 'AL', xk: 'XK', ua: 'UA', ph: 'PH',
+  lt: 'LT', lv: 'LV', ee: 'EE', fi: 'FI', se: 'SE', no: 'NO', dk: 'DK', is: 'IS',
+  mt: 'MT', cy: 'CY', gr: 'GR', bg: 'BG', lu: 'LU', mx: 'MX', ar: 'AR', cl: 'CL',
+  co: 'CO', nz: 'NZ', li: 'LI', sad: 'US'
+};
+
+// Početak riječi (mala slova). Višerječni nazivi traže se kao podniz.
+var NAZIVI_DRZAVA_ = [
+  ['croat', 'HR'], ['hrvat', 'HR'], ['kroat', 'HR'],
+  ['german', 'DE'], ['njemač', 'DE'], ['njemac', 'DE'], ['deutsch', 'DE'], ['allemagne', 'DE'], ['niemc', 'DE'],
+  ['austri', 'AT'], ['österr', 'AT'], ['osterr', 'AT'], ['oesterr', 'AT'],
+  ['sloven', 'SI'], ['serbi', 'RS'], ['srbij', 'RS'],
+  ['bosn', 'BA'], ['hercegov', 'BA'], ['herzegov', 'BA'],
+  ['ital', 'IT'], ['hungar', 'HU'], ['mađar', 'HU'], ['madjar', 'HU'], ['magyar', 'HU'],
+  ['czech', 'CZ'], ['češk', 'CZ'], ['česk', 'CZ'], ['tschech', 'CZ'],
+  ['slovak', 'SK'], ['slovač', 'SK'], ['sloval', 'SK'],
+  ['poland', 'PL'], ['polsk', 'PL'], ['poljsk', 'PL'], ['polen', 'PL'],
+  ['roman', 'RO'], ['rumunj', 'RO'], ['rumän', 'RO'],
+  ['france', 'FR'], ['francusk', 'FR'], ['frankreich', 'FR'],
+  ['spain', 'ES'], ['españa', 'ES'], ['espana', 'ES'], ['španjol', 'ES'], ['spanien', 'ES'],
+  ['portug', 'PT'], ['netherl', 'NL'], ['holland', 'NL'], ['nizozem', 'NL'], ['niederl', 'NL'],
+  ['belgi', 'BE'], ['switz', 'CH'], ['švicar', 'CH'], ['schweiz', 'CH'], ['suisse', 'CH'],
+  ['united kingdom', 'GB'], ['england', 'GB'], ['engleska', 'GB'], ['scotland', 'GB'], ['wales', 'GB'], ['britain', 'GB'], ['britanij', 'GB'],
+  ['ireland', 'IE'], ['irsk', 'IE'], ['irland', 'IE'],
+  ['united states', 'US'], ['america', 'US'], ['amerik', 'US'],
+  ['canad', 'CA'], ['kanad', 'CA'], ['australi', 'AU'], ['brazil', 'BR'], ['brasil', 'BR'],
+  ['montenegr', 'ME'], ['crna gora', 'ME'], ['macedon', 'MK'], ['makedon', 'MK'],
+  ['alban', 'AL'], ['kosov', 'XK'], ['ukrain', 'UA'], ['philip', 'PH'], ['filipin', 'PH'],
+  ['lithuan', 'LT'], ['litv', 'LT'], ['lietuv', 'LT'], ['litauen', 'LT'],
+  ['latvi', 'LV'], ['letton', 'LV'], ['eston', 'EE'], ['finland', 'FI'], ['finsk', 'FI'],
+  ['sweden', 'SE'], ['šveds', 'SE'], ['schweden', 'SE'], ['norw', 'NO'], ['norveš', 'NO'], ['norweg', 'NO'],
+  ['denmark', 'DK'], ['dansk', 'DK'], ['dänemark', 'DK'], ['iceland', 'IS'],
+  ['malta', 'MT'], ['cyprus', 'CY'], ['cipar', 'CY'], ['greece', 'GR'], ['grčk', 'GR'], ['griechen', 'GR'],
+  ['bulgar', 'BG'], ['bugarsk', 'BG'], ['luxemb', 'LU'], ['luksemb', 'LU'], ['liechtenst', 'LI'],
+  ['mexic', 'MX'], ['méxic', 'MX'], ['meksik', 'MX'], ['argentin', 'AR'], ['chile', 'CL'], ['čile', 'CL'],
+  ['colombia', 'CO'], ['kolumbij', 'CO'], ['new zealand', 'NZ'], ['novi zeland', 'NZ']
+];
+
+// Samo kad tekst nema državu. Ključ = cijela riječ ili višerječni podniz.
+var GRADOVI_DRZAVA_ = {
+  zagreb: 'HR', split: 'HR', rijeka: 'HR', osijek: 'HR', zadar: 'HR', dubrovnik: 'HR',
+  'varaždin': 'HR', varazdin: 'HR', pula: 'HR', 'šibenik': 'HR', sibenik: 'HR', karlovac: 'HR',
+  sarajevo: 'BA', mostar: 'BA', 'banja luka': 'BA', tuzla: 'BA', zenica: 'BA', 'široki brijeg': 'BA', livno: 'BA',
+  ljubljana: 'SI', maribor: 'SI', celje: 'SI', 'novo mesto': 'SI',
+  beograd: 'RS', belgrade: 'RS', 'novi sad': 'RS', subotica: 'RS',
+  wien: 'AT', vienna: 'AT', graz: 'AT', linz: 'AT', salzburg: 'AT', innsbruck: 'AT', klagenfurt: 'AT',
+  'münchen': 'DE', munich: 'DE', berlin: 'DE', hamburg: 'DE', 'köln': 'DE', cologne: 'DE',
+  frankfurt: 'DE', stuttgart: 'DE', augsburg: 'DE', regensburg: 'DE', 'nürnberg': 'DE',
+  budapest: 'HU', bratislava: 'SK', prague: 'CZ', praha: 'CZ', warsaw: 'PL', warszawa: 'PL', krakow: 'PL', 'kraków': 'PL',
+  vilnius: 'LT', riga: 'LV', tallinn: 'EE', rome: 'IT', roma: 'IT', milano: 'IT', milan: 'IT',
+  trieste: 'IT', paris: 'FR', madrid: 'ES', london: 'GB', dublin: 'IE', zurich: 'CH', 'zürich': 'CH',
+  podgorica: 'ME', skopje: 'MK'
+};
+
+function rijeci_(s) {
+  return String(s).toLowerCase().split(/[^\p{L}]+/u).filter(Boolean);
+}
+
+/** Država u jednom komadu teksta — { kod, rijeci: [riječi koje je čine] } ili null. */
+function drzavaUTekstu_(tekst, dopustiKod) {
+  var t = String(tekst).trim().toLowerCase().replace(/\s+/g, ' ').replace(/[.]/g, '');
+  if (!t) return null;
+  if (dopustiKod && KODOVI_DRZAVA_.hasOwnProperty(t)) return { kod: KODOVI_DRZAVA_[t], rijeci: rijeci_(t) };
+  var rs = rijeci_(t);
+  for (var i = 0; i < NAZIVI_DRZAVA_.length; i++) {
+    var stem = NAZIVI_DRZAVA_[i][0];
+    if (stem.indexOf(' ') >= 0) {
+      if (t.indexOf(stem) >= 0) return { kod: NAZIVI_DRZAVA_[i][1], rijeci: rijeci_(stem) };
+      continue;
+    }
+    for (var j = 0; j < rs.length; j++) {
+      // 'sad' (SAD) i slični kratki: samo cijela riječ
+      var pogodak = stem.length <= 3 ? rs[j] === stem : rs[j].indexOf(stem) === 0;
+      if (pogodak) return { kod: NAZIVI_DRZAVA_[i][1], rijeci: [rs[j]] };
+    }
+  }
+  return null;
+}
+
+function drzavaPoGradu_(tekst) {
+  var t = String(tekst).toLowerCase().replace(/\s+/g, ' ');
+  var rs = rijeci_(t);
+  for (var grad in GRADOVI_DRZAVA_) {
+    if (grad.indexOf(' ') >= 0 ? t.indexOf(grad) >= 0 : rs.indexOf(grad) >= 0) return GRADOVI_DRZAVA_[grad];
+  }
+  return null;
+}
+
+function bezRijeci_(tekst, rijeci) {
+  return String(tekst).split(/\s+/).filter(function(w) {
+    return rijeci.indexOf(w.toLowerCase().replace(/[^\p{L}]+/gu, '')) === -1;
+  }).join(' ').replace(/^[\s,;\-–]+|[\s,;\-–]+$/g, '');
+}
+
+function parseCityAndCountry(input) {
+  if (!input || !String(input).trim()) return { city: '', country: CONFIG.DEFAULT_COUNTRY };
+
+  var segmenti = String(input).split(/[,;\/]/).map(function(s) { return s.trim(); }).filter(Boolean);
+
+  // 1. segmenti od zadnjeg — kod samo kao cijeli segment (ne prvi, to je grad)
+  for (var i = segmenti.length - 1; i >= 0; i--) {
+    var d = drzavaUTekstu_(segmenti[i], i > 0 || segmenti.length === 1);
+    if (!d) continue;
+    var ostatak = bezRijeci_(segmenti[i], d.rijeci);
+    var city = i > 0 ? segmenti[0] : ostatak;
+    // "Mostar, BiH" → Mostar; "Germany Augsburg" → Augsburg; "Croatia" → ''
+    if (i > 0 && !city) city = ostatak;
+    return { city: city, country: d.kod };
+  }
+
+  // 2. bez države — poznati grad
+  var poGradu = drzavaPoGradu_(input);
+  return { city: segmenti[0] || '', country: poGradu || CONFIG.DEFAULT_COUNTRY };
+}
+
+/**
+ * Mapiraj ISO country code na FIRA-podržani locale.
+ * Prati istu logiku kao FIRA odabir terms jezika:
+ *   HR → 'HR' (termsHR), AT/DE → 'DE' (termsDE), sve ostalo → 'EN' (termsEN).
+ */
+function localeForCountry(countryCode) {
+  if (countryCode === 'HR') return 'HR';
+  if (countryCode === 'DE' || countryCode === 'AT') return 'DE';
+  return 'EN';
+}
+
+// ============================================================================
+// DATE FORMATTING — per FIRA Swagger spec
+// ============================================================================
+
+/** "2025-11-11T22:56:00Z" */
+function formatDateTimeForFira(date) {
+  return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+/** "2025-11-11" */
+function formatDateForFira(date) {
+  return date.toISOString().split('T')[0];
+}
+
+// ============================================================================
+// ROW STATUS TRACKING
+// ============================================================================
+
+function markRowAsProcessed(sheet, row, status, timestamp, documentUrl) {
+  var headers = getHeaders(sheet);
+  var nextCol = sheet.getLastColumn() + 1;
+
+  var statusCol = findColumnIndex(headers, 'FIRA Status');
+  var tsCol = findColumnIndex(headers, 'FIRA Timestamp');
+  var urlCol = findColumnIndex(headers, 'FIRA Document URL');
+
+  if (statusCol === -1) { statusCol = nextCol++; sheet.getRange(1, statusCol).setValue('FIRA Status'); }
+  if (tsCol === -1)     { tsCol = nextCol++;     sheet.getRange(1, tsCol).setValue('FIRA Timestamp'); }
+  if (urlCol === -1)    { urlCol = nextCol++;    sheet.getRange(1, urlCol).setValue('FIRA Document URL'); }
+
+  sheet.getRange(row, statusCol).setValue(status);
+  sheet.getRange(row, tsCol).setValue(timestamp);
+
+  if (documentUrl) {
+    // RichText link umjesto =HYPERLINK formule — Google Sheets auto-extenda
+    // formule u nove Form redove, što propagira tuđi invoice URL u prazne redove.
+    var richLink = SpreadsheetApp.newRichTextValue()
+      .setText('Otvori u FIRA')
+      .setLinkUrl(documentUrl)
+      .build();
+    sheet.getRange(row, urlCol).setRichTextValue(richLink);
+  } else {
+    sheet.getRange(row, urlCol).setValue('');
+  }
+
+  sheet.getRange(row, statusCol).setBackground(status === 'SUCCESS' ? '#d9ead3' : '#f4cccc');
+}

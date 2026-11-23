@@ -1,0 +1,9 @@
+gas/dist/
+node_modules/
+.DS_Store
+*.log
+secrets/
+.env*
+.dev.vars
+*api-kljuc*
+.clasp.json

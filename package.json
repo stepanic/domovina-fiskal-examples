@@ -1,0 +1,14 @@
+{
+  "name": "domovina-fiskal-examples",
+  "private": true,
+  "type": "module",
+  "description": "Primjeri integracije s Domovina Fiskal API-jem: Google Forms/Sheets (Apps Script) i backend nakon Stripe plaćanja",
+  "license": "MIT",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "build": "node scripts/build-gas.mjs",
+    "push": "node scripts/push-gas.mjs",
+    "postavke": "scripts/fiskal-postavke.sh",
+    "test": "node scripts/test-gas.mjs && scripts/test-shema.sh && node --test examples/stripe-cloudflare-worker/*.test.ts"
+  }
+}

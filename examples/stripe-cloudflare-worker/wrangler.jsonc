@@ -1,0 +1,17 @@
+// Primjer konfiguracije. Secreti NE idu ovdje:
+//   wrangler secret put STRIPE_SECRET_KEY
+//   wrangler secret put STRIPE_WEBHOOK_SECRET
+//   wrangler secret put FISKAL_API_KEY
+// Lokalno: .dev.vars (u .gitignore).
+{
+  "name": "domovina-fiskal-stripe-example",
+  "main": "worker.ts",
+  "compatibility_date": "2026-11-01",
+  "vars": {
+    "FISKAL_BASE_URL": "https://fiskal-test.domovina.ai/api/v1",
+    "FISKAL_PROSTOR": "1",
+    "FISKAL_UREDAJ": "1",
+    "FISKAL_OPERATER_OIB": "12345678903",
+    "FISKAL_PDV_STOPA": "0"
+  }
+}

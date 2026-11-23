@@ -1,0 +1,19 @@
+{
+  "naziv": "Primjer konferencija 2027 (izmišljeni primjer)",
+  "okoline": {
+    "test": {
+      "opis": "DEV kopija Sheeta ↔ Domovina Fiskal TEST (CIS TEST okolina, demo certifikat)",
+      "sheetId": "<ID_TEST_SHEETA>",
+      "fiskalBaseUrl": "https://fiskal-test.domovina.ai/api/v1",
+      "apiKljucDatoteka": "secrets/test-api-kljuc.txt",
+      "scriptId": null
+    },
+    "prod": {
+      "opis": "Pravi Sheet ↔ Domovina Fiskal PROD (pravi CIS — svaki račun je stvaran!)",
+      "sheetId": "<ID_PROD_SHEETA>",
+      "fiskalBaseUrl": "https://fiskal.domovina.ai/api/v1",
+      "apiKljucDatoteka": "secrets/prod-api-kljuc.txt",
+      "scriptId": null
+    }
+  }
+}
